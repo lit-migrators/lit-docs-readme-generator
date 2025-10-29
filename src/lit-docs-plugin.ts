@@ -1,12 +1,12 @@
 import type { Plugin } from '@stencil/core/internal';
-import { generateDocs } from 'lit-docs-generator';
 import { join } from 'path';
+import { generateDocs } from '.';
 
 /**
  * Stencil plugin that generates README documentation for Lit components
  * during the build process.
  */
-export function litDocsPlugin(): Plugin {
+export function litDocsPlugin(): any {
   return {
     name: 'lit-docs-generator',
 

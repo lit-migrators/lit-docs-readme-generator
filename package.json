@@ -1,6 +1,6 @@
 {
   "name": "lit-docs-generator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Generate Stencil.js-compatible README documentation for Lit components",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -30,6 +30,7 @@
     "typescript": "^5.7.3"
   },
   "devDependencies": {
+    "@stencil/core": "^4.38.2",
     "@types/node": "^22.10.5",
     "lit": "^3.2.1",
     "tsx": "^4.19.2"
