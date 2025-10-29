@@ -27,6 +27,17 @@ yarn add -D lit-docs-generator
 
 ## Usage
 
+Use with stencil:
+```
+import { litDocsPlugin } from './plugins/lit-docs-plugin';
+...
+  plugins: [
+    litDocsPlugin(),
+    cemMergerPlugin(),
+  ],
+...
+```
+
 ### Command Line
 
 ```bash
