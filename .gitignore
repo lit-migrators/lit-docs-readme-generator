@@ -2,3 +2,4 @@ node_modules
 dist
 *.log
 examples/**/README.md
+examples/test-real

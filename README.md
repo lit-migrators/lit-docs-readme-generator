@@ -433,6 +433,10 @@ This generator produces documentation compatible with Stencil.js but works with 
 
 MIT
 
+## Important disclaimer
+
+This project is generated with AI.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
