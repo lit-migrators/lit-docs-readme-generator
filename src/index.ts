@@ -88,6 +88,3 @@ export async function generateDocs(options: GeneratorOptions): Promise<number> {
 export function generateComponentDocs(filePath: string): LitComponentDocs | null {
   return parseLitComponent(filePath);
 }
-
-
-export * from './lit-docs-plugin';
