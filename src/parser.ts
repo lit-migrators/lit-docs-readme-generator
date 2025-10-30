@@ -3,8 +3,8 @@
  */
 
 import ts from 'typescript';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { dirname, resolve as resolvePath, basename as pathBasename } from 'node:path';
+import { readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { dirname, resolve as resolvePath, basename as pathBasename, parse as parsePath, extname as pathExtname } from 'node:path';
 
 interface ClassDocParts {
   description?: string;
@@ -41,6 +41,13 @@ interface MixinContext {
   docsCache: Map<string, ClassDocParts>;
   resolvingKeys: Set<string>;
   fileInfoMap: Map<string, FileInfo>;
+}
+
+interface PropertyDecoratorInfo {
+  attribute?: string;
+  reflects?: boolean;
+  state?: boolean;
+  type?: string;
 }
 import type {
   LitComponentDocs,
@@ -210,8 +217,20 @@ function parseProperty(
   }
 
   const jsDoc = parseJsDoc(node, sourceFile);
-  const type = node.type ? node.type.getText() : 'any';
+  let type = node.type ? node.type.getText() : undefined;
   let defaultValue = node.initializer ? node.initializer.getText() : undefined;
+
+  if (!type && decoratorInfo.type) {
+    type = decoratorInfo.type;
+  }
+
+  if (!type && node.initializer) {
+    type = inferTypeFromInitializer(node.initializer);
+  }
+
+  if (!type) {
+    type = 'any';
+  }
 
   // Sanitize default values for markdown tables
   if (defaultValue) {
@@ -252,12 +271,101 @@ function sanitizeDefaultValue(value: string): string {
   return value;
 }
 
+function getTypeFromDecoratorExpression(expression: ts.Expression): string | undefined {
+  if (ts.isIdentifier(expression) || ts.isPropertyAccessExpression(expression)) {
+    return normalizeDecoratorTypeName(expression.getText());
+  }
+
+  if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+    return normalizeDecoratorTypeName(expression.text);
+  }
+
+  if (ts.isCallExpression(expression)) {
+    return normalizeDecoratorTypeName(expression.expression.getText());
+  }
+
+  if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+    return getTypeFromDecoratorExpression(expression.expression);
+  }
+
+  return normalizeDecoratorTypeName(expression.getText());
+}
+
+function normalizeDecoratorTypeName(raw: string): string | undefined {
+  const cleaned = raw
+    .replace(/Constructor$/u, '')
+    .trim();
+
+  switch (cleaned) {
+    case 'String':
+      return 'string';
+    case 'Number':
+      return 'number';
+    case 'Boolean':
+      return 'boolean';
+    case 'Array':
+      return 'unknown[]';
+    case 'Object':
+      return 'Record<string, unknown>';
+    case 'Date':
+      return 'Date';
+    default:
+      return cleaned || undefined;
+  }
+}
+
+function inferTypeFromInitializer(initializer: ts.Expression): string | undefined {
+  if (ts.isStringLiteral(initializer) || ts.isNoSubstitutionTemplateLiteral(initializer)) {
+    return 'string';
+  }
+
+  if (
+    initializer.kind === ts.SyntaxKind.TrueKeyword ||
+    initializer.kind === ts.SyntaxKind.FalseKeyword
+  ) {
+    return 'boolean';
+  }
+
+  if (ts.isNumericLiteral(initializer) || initializer.kind === ts.SyntaxKind.BigIntLiteral) {
+    return 'number';
+  }
+
+  if (ts.isPrefixUnaryExpression(initializer) && ts.isNumericLiteral(initializer.operand)) {
+    return 'number';
+  }
+
+  if (ts.isArrayLiteralExpression(initializer)) {
+    return 'unknown[]';
+  }
+
+  if (ts.isObjectLiteralExpression(initializer)) {
+    return 'Record<string, unknown>';
+  }
+
+  if (ts.isTemplateExpression(initializer)) {
+    return 'string';
+  }
+
+  if (initializer.kind === ts.SyntaxKind.NullKeyword) {
+    return 'null';
+  }
+
+  if (ts.isIdentifier(initializer)) {
+    const identifier = initializer.getText();
+    if (identifier === 'undefined') {
+      return 'undefined';
+    }
+  }
+
+  return undefined;
+}
+
 /**
  * Extract @property or @state decorator information
  */
 function extractPropertyDecorator(
   node: ts.PropertyDeclaration
-): { attribute?: string; reflects?: boolean; state?: boolean } | null {
+): PropertyDecoratorInfo | null {
   if (!ts.canHaveDecorators(node)) return null;
 
   const decorators = ts.getDecorators(node);
@@ -278,6 +386,7 @@ function extractPropertyDecorator(
           const options = args[0];
           let attribute: string | undefined;
           let reflects: boolean | undefined;
+          let decoratorType: string | undefined;
 
           options.properties.forEach((prop) => {
             if (ts.isPropertyAssignment(prop)) {
@@ -290,11 +399,13 @@ function extractPropertyDecorator(
                 }
               } else if (propName === 'reflect' && prop.initializer.getText() === 'true') {
                 reflects = true;
+              } else if (propName === 'type') {
+                decoratorType = getTypeFromDecoratorExpression(prop.initializer);
               }
             }
           });
 
-          return { attribute, reflects };
+          return { attribute, reflects, type: decoratorType };
         }
         return {};
       }
@@ -1058,21 +1169,105 @@ function resolveImportPath(specifier: string, fromFile: string): string | null {
     ? resolvePath(baseDir, specifier)
     : resolvePath(specifier);
 
-  const resolvedDirect = tryResolveFile(rawPath);
-  if (resolvedDirect) {
-    return resolvedDirect;
+  const fallbackBase = pathBasename(specifier);
+
+  const candidateBases = new Set<string>();
+  addBasePathVariants(candidateBases, rawPath);
+  if (fallbackBase) {
+    addBasePathVariants(candidateBases, resolvePath(baseDir, fallbackBase));
   }
 
-  const fallbackBase = pathBasename(specifier);
+  for (const candidate of candidateBases) {
+    const resolved = tryResolveFile(candidate);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
   if (fallbackBase) {
-    const fallbackPath = resolvePath(baseDir, fallbackBase);
-    const resolvedFallback = tryResolveFile(fallbackPath);
-    if (resolvedFallback) {
-      return resolvedFallback;
+    const searchDirs = new Set<string>();
+    const rawDir = dirname(rawPath);
+    if (rawDir) {
+      searchDirs.add(rawDir);
+    }
+    searchDirs.add(baseDir);
+
+    for (const dir of searchDirs) {
+      const nearby = searchDirectoryForMatchingFile(dir, fallbackBase);
+      if (nearby) {
+        const resolved = tryResolveFile(nearby);
+        if (resolved) {
+          return resolved;
+        }
+      }
     }
   }
 
   return null;
+}
+
+const BASE_PATH_SUFFIXES = ['.mixin', '.mixins', '.component', '.element', '.lit', '.styles'];
+
+function addBasePathVariants(target: Set<string>, basePath: string | null): void {
+  if (!basePath) {
+    return;
+  }
+
+  target.add(basePath);
+
+  const parsed = parsePath(basePath);
+  if (!parsed.ext) {
+    const dir = parsed.dir || '.';
+    const baseName = parsed.base;
+
+    BASE_PATH_SUFFIXES.forEach((suffix) => {
+      target.add(resolvePath(dir, `${baseName}${suffix}`));
+    });
+  }
+}
+
+const MATCHING_EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.mjs', '.cjs', '.jsx']);
+
+function searchDirectoryForMatchingFile(directory: string, baseName: string): string | null {
+  if (!baseName) {
+    return null;
+  }
+
+  try {
+    const entries = readdirSync(directory, { withFileTypes: true });
+    let bestMatch: { path: string; score: number } | null = null;
+
+    for (const entry of entries) {
+      const entryName = entry.name;
+
+      if (entry.isFile()) {
+        const extension = pathExtname(entryName);
+        if (!MATCHING_EXTENSIONS.has(extension)) {
+          continue;
+        }
+        if (!entryName.startsWith(baseName)) {
+          continue;
+        }
+
+        const candidatePath = resolvePath(directory, entryName);
+        const score = entryName.length - baseName.length;
+
+        if (!bestMatch || score < bestMatch.score) {
+          bestMatch = { path: candidatePath, score };
+        }
+      } else if (entry.isDirectory() && entryName.startsWith(baseName)) {
+        const candidateDirectory = resolvePath(directory, entryName);
+        const resolved = tryResolveFile(candidateDirectory);
+        if (resolved) {
+          return resolved;
+        }
+      }
+    }
+
+    return bestMatch?.path ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function tryResolveFile(basePath: string): string | null {
