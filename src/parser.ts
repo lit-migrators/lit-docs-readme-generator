@@ -4,7 +4,7 @@
 
 import ts from 'typescript';
 import { readFileSync, existsSync, statSync } from 'node:fs';
-import { dirname, resolve as resolvePath } from 'node:path';
+import { dirname, resolve as resolvePath, basename as pathBasename } from 'node:path';
 
 interface ClassDocParts {
   description?: string;
@@ -136,6 +136,7 @@ function parseClassDeclaration(
   for (const mixinName of mixinNames) {
     const mixinDocs = resolveMixinDocs(mixinName, mixinContext, filePath);
     if (mixinDocs) {
+      mixinDocs.methods = [];
       mergeClassDocParts(classDocs, mixinDocs);
     }
   }
@@ -1057,27 +1058,47 @@ function resolveImportPath(specifier: string, fromFile: string): string | null {
     ? resolvePath(baseDir, specifier)
     : resolvePath(specifier);
 
-  return tryResolveFile(rawPath);
+  const resolvedDirect = tryResolveFile(rawPath);
+  if (resolvedDirect) {
+    return resolvedDirect;
+  }
+
+  const fallbackBase = pathBasename(specifier);
+  if (fallbackBase) {
+    const fallbackPath = resolvePath(baseDir, fallbackBase);
+    const resolvedFallback = tryResolveFile(fallbackPath);
+    if (resolvedFallback) {
+      return resolvedFallback;
+    }
+  }
+
+  return null;
 }
 
 function tryResolveFile(basePath: string): string | null {
   const candidates = new Set<string>();
   const extensionPriority = ['.ts', '.tsx', '.mts', '.cts', '.js', '.mjs', '.cjs', '.jsx'];
+  const knownExtensions = new Set(extensionPriority);
+  const tsExtensions = new Set(['.ts', '.tsx', '.mts', '.cts']);
+  const jsExtensions = new Set(['.js', '.mjs', '.cjs', '.jsx']);
 
   candidates.add(basePath);
 
   const lastSlash = Math.max(basePath.lastIndexOf('/'), basePath.lastIndexOf('\\'));
   const lastDot = basePath.lastIndexOf('.');
-  const hasExtension = lastDot > lastSlash;
-  const baseWithoutExt = hasExtension ? basePath.slice(0, lastDot) : basePath;
-  const currentExtension = hasExtension ? basePath.slice(lastDot) : '';
+  const hasDot = lastDot > lastSlash;
+  const currentExtension = hasDot ? basePath.slice(lastDot) : '';
+  const extensionRecognized = hasDot && knownExtensions.has(currentExtension);
 
-  if (!hasExtension) {
+  if (!extensionRecognized) {
     extensionPriority.forEach((ext) => candidates.add(`${basePath}${ext}`));
-  } else if (['.js', '.mjs', '.cjs'].includes(currentExtension)) {
-    ['.ts', '.tsx', '.mts', '.cts'].forEach((ext) => candidates.add(`${baseWithoutExt}${ext}`));
-  } else if (['.ts', '.tsx', '.mts', '.cts'].includes(currentExtension)) {
-    ['.js', '.mjs', '.cjs'].forEach((ext) => candidates.add(`${baseWithoutExt}${ext}`));
+  } else {
+    const baseWithoutExt = basePath.slice(0, lastDot);
+    if (jsExtensions.has(currentExtension)) {
+      tsExtensions.forEach((ext) => candidates.add(`${baseWithoutExt}${ext}`));
+    } else if (tsExtensions.has(currentExtension)) {
+      jsExtensions.forEach((ext) => candidates.add(`${baseWithoutExt}${ext}`));
+    }
   }
 
   for (const candidate of candidates) {
@@ -1154,6 +1175,15 @@ function extractClassFromFunctionLike(node: ts.FunctionLikeDeclarationBase): ts.
         }
       }
     }
+
+    if (classDeclarations.size > 0) {
+      for (const classDecl of classDeclarations.values()) {
+        if (classHasExtendsClause(classDecl)) {
+          return classDecl;
+        }
+      }
+      return classDeclarations.values().next().value ?? null;
+    }
     return null;
   }
 
@@ -1187,4 +1217,17 @@ function extractClassFromExpression(expression: ts.Expression): ts.ClassLikeDecl
     return extractClassFromExpression(expression.expression);
   }
   return null;
+}
+
+function classHasExtendsClause(node: ts.ClassLikeDeclarationBase): boolean {
+  const clauses = node.heritageClauses;
+  if (!clauses) return false;
+
+  for (const clause of clauses) {
+    if (clause.token === ts.SyntaxKind.ExtendsKeyword && clause.types.length > 0) {
+      return true;
+    }
+  }
+
+  return false;
 }
