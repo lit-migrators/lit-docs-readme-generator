@@ -3,7 +3,45 @@
  */
 
 import ts from 'typescript';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { dirname, resolve as resolvePath } from 'node:path';
+
+interface ClassDocParts {
+  description?: string;
+  usage?: string[];
+  dependencies?: string[];
+  slots: SlotDocs[];
+  cssProperties: CssPropertyDocs[];
+  cssParts: CssPartDocs[];
+  properties: PropertyDocs[];
+  events: EventDocs[];
+  methods: MethodDocs[];
+}
+
+interface MixinDeclaration {
+  classNode: ts.ClassLikeDeclarationBase;
+  docNode: ts.Node;
+  filePath: string;
+}
+
+interface ImportRecord {
+  filePath: string | null;
+  exportName: string;
+  type: 'named' | 'default' | 'namespace';
+}
+
+interface FileInfo {
+  filePath: string;
+  sourceFile: ts.SourceFile;
+  declarations: Map<string, MixinDeclaration>;
+  imports: Map<string, ImportRecord>;
+}
+
+interface MixinContext {
+  docsCache: Map<string, ClassDocParts>;
+  resolvingKeys: Set<string>;
+  fileInfoMap: Map<string, FileInfo>;
+}
 import type {
   LitComponentDocs,
   PropertyDocs,
@@ -28,13 +66,20 @@ export function parseLitComponent(filePath: string): LitComponentDocs | null {
   );
 
   let componentDocs: LitComponentDocs | null = null;
+  const mixinContext: MixinContext = {
+    docsCache: new Map(),
+    resolvingKeys: new Set(),
+    fileInfoMap: new Map(),
+  };
+
+  ensureFileInfo(filePath, mixinContext, sourceFile);
 
   function visit(node: ts.Node) {
     // Look for class declarations
     if (ts.isClassDeclaration(node) && node.name) {
       // Check if it extends LitElement
       if (extendsLitElement(node)) {
-        componentDocs = parseClassDeclaration(node, filePath, sourceFile);
+        componentDocs = parseClassDeclaration(node, filePath, sourceFile, mixinContext);
       }
     }
 
@@ -72,7 +117,8 @@ function extendsLitElement(node: ts.ClassDeclaration): boolean {
 function parseClassDeclaration(
   node: ts.ClassDeclaration,
   filePath: string,
-  sourceFile: ts.SourceFile
+  sourceFile: ts.SourceFile,
+  mixinContext: MixinContext
 ): LitComponentDocs | null {
   const className = node.name?.getText() || 'Unknown';
 
@@ -84,53 +130,28 @@ function parseClassDeclaration(
   }
 
   // Extract class-level JSDoc
-  const classJsDoc = parseJsDoc(node, sourceFile);
+  const classDocs = collectClassDocParts(node, sourceFile);
 
-  const properties: PropertyDocs[] = [];
-  const methods: MethodDocs[] = [];
-  const events: EventDocs[] = [];
-  const slots: SlotDocs[] = [];
-  const cssProperties: CssPropertyDocs[] = [];
-  const cssParts: CssPartDocs[] = [];
-
-  // Parse class members
-  node.members.forEach((member) => {
-    if (ts.isPropertyDeclaration(member)) {
-      const prop = parseProperty(member, sourceFile);
-      if (prop) properties.push(prop);
-    } else if (ts.isMethodDeclaration(member)) {
-      const method = parseMethod(member, sourceFile);
-      if (method) methods.push(method);
+  const mixinNames = extractMixinNamesFromClass(node);
+  for (const mixinName of mixinNames) {
+    const mixinDocs = resolveMixinDocs(mixinName, mixinContext, filePath);
+    if (mixinDocs) {
+      mergeClassDocParts(classDocs, mixinDocs);
     }
-  });
-
-  // Extract events from dispatchEvent calls
-  const extractedEvents = extractEvents(node, sourceFile);
-  events.push(...extractedEvents);
-
-  // Extract slots, CSS properties, and parts from JSDoc
-  if (classJsDoc.slots) {
-    classJsDoc.slots.forEach((slot) => slots.push(slot));
-  }
-  if (classJsDoc.cssProperties) {
-    classJsDoc.cssProperties.forEach((prop) => cssProperties.push(prop));
-  }
-  if (classJsDoc.cssParts) {
-    classJsDoc.cssParts.forEach((part) => cssParts.push(part));
   }
 
   return {
     className,
     tagName,
-    description: classJsDoc.description,
-    usage: classJsDoc.usage,
-    properties,
-    events,
-    methods,
-    slots,
-    cssProperties,
-    cssParts,
-    dependencies: classJsDoc.dependencies,
+    description: classDocs.description,
+    usage: classDocs.usage,
+    properties: classDocs.properties,
+    events: classDocs.events,
+    methods: classDocs.methods,
+    slots: classDocs.slots,
+    cssProperties: classDocs.cssProperties,
+    cssParts: classDocs.cssParts,
+    dependencies: classDocs.dependencies,
     filePath,
   };
 }
@@ -362,7 +383,7 @@ function isLifecycleMethod(name: string): boolean {
  * Extract events from dispatchEvent calls
  */
 function extractEvents(
-  node: ts.ClassDeclaration,
+  node: ts.ClassLikeDeclarationBase,
   sourceFile: ts.SourceFile
 ): EventDocs[] {
   const events: EventDocs[] = [];
@@ -607,4 +628,563 @@ function parseCssPartTag(comment: string): CssPartDocs {
     return { name, description };
   }
   return { name: comment };
+}
+
+function collectClassDocParts(
+  node: ts.ClassLikeDeclarationBase,
+  sourceFile: ts.SourceFile
+): ClassDocParts {
+  const classJsDoc = parseJsDoc(node, sourceFile);
+
+  const docParts: ClassDocParts = {
+    description: classJsDoc.description,
+    usage: classJsDoc.usage ? [...classJsDoc.usage] : undefined,
+    dependencies: classJsDoc.dependencies ? [...classJsDoc.dependencies] : undefined,
+    slots: classJsDoc.slots ? classJsDoc.slots.map((slot) => ({ ...slot })) : [],
+    cssProperties: classJsDoc.cssProperties ? classJsDoc.cssProperties.map((prop) => ({ ...prop })) : [],
+    cssParts: classJsDoc.cssParts ? classJsDoc.cssParts.map((part) => ({ ...part })) : [],
+    properties: [],
+    events: [],
+    methods: [],
+  };
+
+  node.members?.forEach((member) => {
+    if (ts.isPropertyDeclaration(member)) {
+      const prop = parseProperty(member as ts.PropertyDeclaration, sourceFile);
+      if (prop) docParts.properties.push({ ...prop });
+    } else if (ts.isMethodDeclaration(member)) {
+      const method = parseMethod(member, sourceFile);
+      if (method) {
+        docParts.methods.push({
+          ...method,
+          parameters: method.parameters.map((param) => ({ ...param })),
+          returns: method.returns ? { ...method.returns } : undefined,
+        });
+      }
+    }
+  });
+
+  const extractedEvents = extractEvents(node, sourceFile);
+  extractedEvents.forEach((event) => {
+    docParts.events.push({ ...event });
+  });
+
+  return docParts;
+}
+
+function mergeClassDocParts(target: ClassDocParts, source: ClassDocParts): void {
+  if (!target.description && source.description) {
+    target.description = source.description;
+  }
+
+  if (source.usage && source.usage.length > 0) {
+    target.usage ??= [];
+    source.usage.forEach((example) => {
+      if (!target.usage!.includes(example)) {
+        target.usage!.push(example);
+      }
+    });
+  }
+
+  if (source.dependencies && source.dependencies.length > 0) {
+    target.dependencies ??= [];
+    source.dependencies.forEach((dependency) => {
+      if (!target.dependencies!.includes(dependency)) {
+        target.dependencies!.push(dependency);
+      }
+    });
+  }
+
+  source.properties.forEach((prop) => {
+    if (!target.properties.some((existing) => existing.name === prop.name)) {
+      target.properties.push({ ...prop });
+    }
+  });
+
+  source.events.forEach((event) => {
+    if (!target.events.some((existing) => existing.name === event.name)) {
+      target.events.push({ ...event });
+    }
+  });
+
+  source.methods.forEach((method) => {
+    if (!target.methods.some((existing) => existing.name === method.name)) {
+      target.methods.push({
+        ...method,
+        parameters: method.parameters.map((param) => ({ ...param })),
+        returns: method.returns ? { ...method.returns } : undefined,
+      });
+    }
+  });
+
+  source.slots.forEach((slot) => {
+    if (!target.slots.some((existing) => existing.name === slot.name)) {
+      target.slots.push({ ...slot });
+    }
+  });
+
+  source.cssProperties.forEach((prop) => {
+    if (!target.cssProperties.some((existing) => existing.name === prop.name)) {
+      target.cssProperties.push({ ...prop });
+    }
+  });
+
+  source.cssParts.forEach((part) => {
+    if (!target.cssParts.some((existing) => existing.name === part.name)) {
+      target.cssParts.push({ ...part });
+    }
+  });
+}
+
+function cloneClassDocParts(source: ClassDocParts): ClassDocParts {
+  return {
+    description: source.description,
+    usage: source.usage ? [...source.usage] : undefined,
+    dependencies: source.dependencies ? [...source.dependencies] : undefined,
+    slots: source.slots.map((slot) => ({ ...slot })),
+    cssProperties: source.cssProperties.map((prop) => ({ ...prop })),
+    cssParts: source.cssParts.map((part) => ({ ...part })),
+    properties: source.properties.map((prop) => ({ ...prop })),
+    events: source.events.map((event) => ({ ...event })),
+    methods: source.methods.map((method) => ({
+      ...method,
+      parameters: method.parameters.map((param) => ({ ...param })),
+      returns: method.returns ? { ...method.returns } : undefined,
+    })),
+  };
+}
+
+function extractMixinNamesFromClass(node: ts.ClassLikeDeclarationBase): string[] {
+  const names: string[] = [];
+
+  node.heritageClauses?.forEach((clause) => {
+    if (clause.token === ts.SyntaxKind.ExtendsKeyword) {
+      clause.types.forEach((type) => {
+        names.push(...collectMixinNamesFromExpression(type.expression));
+      });
+    }
+  });
+
+  return Array.from(new Set(names.filter(Boolean)));
+}
+
+function collectMixinNamesFromExpression(expression: ts.Expression): string[] {
+  if (ts.isCallExpression(expression)) {
+    const results: string[] = [];
+    const calleeName = getExpressionName(expression.expression);
+    if (calleeName) {
+      results.push(calleeName);
+    }
+
+    expression.arguments.forEach((arg) => {
+      results.push(...collectMixinNamesFromExpression(arg));
+    });
+
+    return results;
+  }
+
+  const name = getExpressionName(expression);
+  return name ? [name] : [];
+}
+
+function getExpressionName(expression: ts.Expression): string | null {
+  if (ts.isIdentifier(expression)) {
+    return expression.getText();
+  }
+  if (ts.isPropertyAccessExpression(expression)) {
+    return expression.getText();
+  }
+  if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+    return getExpressionName(expression.expression);
+  }
+  if (ts.isParenthesizedExpression(expression)) {
+    return getExpressionName(expression.expression);
+  }
+  return null;
+}
+
+function resolveMixinDocs(
+  mixinName: string,
+  context: MixinContext,
+  filePath: string
+): ClassDocParts | null {
+  if (!mixinName) {
+    return null;
+  }
+
+  const key = `${filePath}::${mixinName}`;
+
+  const cached = context.docsCache.get(key);
+  if (cached) {
+    return cloneClassDocParts(cached);
+  }
+
+  if (context.resolvingKeys.has(key)) {
+    return null;
+  }
+
+  const fileInfo = ensureFileInfo(filePath, context);
+  if (!fileInfo) {
+    return null;
+  }
+
+  const declaration = fileInfo.declarations.get(mixinName);
+  if (declaration) {
+    context.resolvingKeys.add(key);
+    const docs = buildDocsFromDeclaration(declaration, context);
+    context.resolvingKeys.delete(key);
+
+    const cloned = cloneClassDocParts(docs);
+    context.docsCache.set(key, cloned);
+    return cloneClassDocParts(cloned);
+  }
+
+  const importRecord = fileInfo.imports.get(mixinName);
+  if (importRecord && importRecord.filePath) {
+    if (importRecord.type === 'namespace') {
+      // Namespace imports (import * as) are not resolved automatically
+      return null;
+    }
+
+    context.resolvingKeys.add(key);
+    const docs = resolveMixinDocs(importRecord.exportName, context, importRecord.filePath);
+    context.resolvingKeys.delete(key);
+
+    if (docs) {
+      const cloned = cloneClassDocParts(docs);
+      context.docsCache.set(key, cloned);
+      return cloneClassDocParts(cloned);
+    }
+  }
+
+  return null;
+}
+
+function buildDocsFromDeclaration(
+  declaration: MixinDeclaration,
+  context: MixinContext
+): ClassDocParts {
+  const fileInfo = ensureFileInfo(declaration.filePath, context);
+  if (!fileInfo) {
+    return {
+      properties: [],
+      events: [],
+      methods: [],
+      slots: [],
+      cssProperties: [],
+      cssParts: [],
+    };
+  }
+
+  const docs = collectClassDocParts(declaration.classNode, fileInfo.sourceFile);
+
+  if (declaration.docNode !== declaration.classNode) {
+    const jsDoc = parseJsDoc(declaration.docNode, fileInfo.sourceFile);
+    mergeClassDocParts(docs, docPartsFromJsDoc(jsDoc));
+  }
+
+  const mixinNames = extractMixinNamesFromClass(declaration.classNode);
+  mixinNames.forEach((name) => {
+    const depDocs = resolveMixinDocs(name, context, declaration.filePath);
+    if (depDocs) {
+      mergeClassDocParts(docs, depDocs);
+    }
+  });
+
+  return docs;
+}
+
+function ensureFileInfo(
+  filePath: string,
+  context: MixinContext,
+  existingSourceFile?: ts.SourceFile
+): FileInfo | null {
+  if (context.fileInfoMap.has(filePath)) {
+    return context.fileInfoMap.get(filePath)!;
+  }
+
+  let sourceFile = existingSourceFile;
+
+  if (!sourceFile) {
+    if (!existsSync(filePath)) {
+      return null;
+    }
+    const sourceCode = readFileSync(filePath, 'utf-8');
+    sourceFile = ts.createSourceFile(
+      filePath,
+      sourceCode,
+      ts.ScriptTarget.Latest,
+      true
+    );
+  }
+
+  const declarations = collectMixinDeclarations(sourceFile, filePath);
+  const imports = collectImportRecords(sourceFile, filePath);
+
+  const info: FileInfo = {
+    filePath,
+    sourceFile,
+    declarations,
+    imports,
+  };
+
+  context.fileInfoMap.set(filePath, info);
+  return info;
+}
+
+function collectMixinDeclarations(
+  sourceFile: ts.SourceFile,
+  filePath: string
+): Map<string, MixinDeclaration> {
+  const declarations = new Map<string, MixinDeclaration>();
+
+  function visit(node: ts.Node) {
+    if (ts.isVariableStatement(node)) {
+      node.declarationList.declarations.forEach((declaration) => {
+        if (ts.isIdentifier(declaration.name) && declaration.initializer) {
+          const classNode = extractClassFromInitializer(declaration.initializer);
+          if (classNode) {
+            declarations.set(declaration.name.text, {
+              classNode,
+              docNode: declaration,
+              filePath,
+            });
+          }
+        }
+      });
+    } else if (ts.isFunctionDeclaration(node) && node.name) {
+      const classNode = extractClassFromFunctionLike(node);
+      if (classNode) {
+        declarations.set(node.name.text, {
+          classNode,
+          docNode: node,
+          filePath,
+        });
+      }
+    } else if (ts.isExportAssignment(node)) {
+      const classNode = extractClassFromExpression(node.expression);
+      if (classNode) {
+        declarations.set('default', {
+          classNode,
+          docNode: node,
+          filePath,
+        });
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return declarations;
+}
+
+function collectImportRecords(
+  sourceFile: ts.SourceFile,
+  filePath: string
+): Map<string, ImportRecord> {
+  const imports = new Map<string, ImportRecord>();
+
+  sourceFile.forEachChild((node) => {
+    if (!ts.isImportDeclaration(node) || !node.importClause) {
+      return;
+    }
+
+    if (!ts.isStringLiteral(node.moduleSpecifier)) {
+      return;
+    }
+
+    const resolvedPath = resolveImportPath(node.moduleSpecifier.text, filePath);
+    const importClause = node.importClause;
+
+    if (importClause.name) {
+      imports.set(importClause.name.getText(), {
+        filePath: resolvedPath,
+        exportName: 'default',
+        type: 'default',
+      });
+    }
+
+    if (importClause.namedBindings) {
+      if (ts.isNamedImports(importClause.namedBindings)) {
+        importClause.namedBindings.elements.forEach((element) => {
+          const localName = element.name.getText();
+          const exportedName = element.propertyName
+            ? element.propertyName.getText()
+            : element.name.getText();
+
+          imports.set(localName, {
+            filePath: resolvedPath,
+            exportName: exportedName,
+            type: 'named',
+          });
+        });
+      } else if (ts.isNamespaceImport(importClause.namedBindings)) {
+        const localName = importClause.namedBindings.name.getText();
+        imports.set(localName, {
+          filePath: resolvedPath,
+          exportName: '*',
+          type: 'namespace',
+        });
+      }
+    }
+  });
+
+  return imports;
+}
+
+function docPartsFromJsDoc(jsDoc: ReturnType<typeof parseJsDoc>): ClassDocParts {
+  return {
+    description: jsDoc.description,
+    usage: jsDoc.usage ? [...jsDoc.usage] : undefined,
+    dependencies: jsDoc.dependencies ? [...jsDoc.dependencies] : undefined,
+    slots: jsDoc.slots ? jsDoc.slots.map((slot) => ({ ...slot })) : [],
+    cssProperties: jsDoc.cssProperties ? jsDoc.cssProperties.map((prop) => ({ ...prop })) : [],
+    cssParts: jsDoc.cssParts ? jsDoc.cssParts.map((part) => ({ ...part })) : [],
+    properties: [],
+    events: [],
+    methods: [],
+  };
+}
+
+function resolveImportPath(specifier: string, fromFile: string): string | null {
+  if (!specifier.startsWith('.') && !specifier.startsWith('/')) {
+    return null;
+  }
+
+  const baseDir = dirname(fromFile);
+  const rawPath = specifier.startsWith('.')
+    ? resolvePath(baseDir, specifier)
+    : resolvePath(specifier);
+
+  return tryResolveFile(rawPath);
+}
+
+function tryResolveFile(basePath: string): string | null {
+  const candidates = new Set<string>();
+  const extensionPriority = ['.ts', '.tsx', '.mts', '.cts', '.js', '.mjs', '.cjs', '.jsx'];
+
+  candidates.add(basePath);
+
+  const lastSlash = Math.max(basePath.lastIndexOf('/'), basePath.lastIndexOf('\\'));
+  const lastDot = basePath.lastIndexOf('.');
+  const hasExtension = lastDot > lastSlash;
+  const baseWithoutExt = hasExtension ? basePath.slice(0, lastDot) : basePath;
+  const currentExtension = hasExtension ? basePath.slice(lastDot) : '';
+
+  if (!hasExtension) {
+    extensionPriority.forEach((ext) => candidates.add(`${basePath}${ext}`));
+  } else if (['.js', '.mjs', '.cjs'].includes(currentExtension)) {
+    ['.ts', '.tsx', '.mts', '.cts'].forEach((ext) => candidates.add(`${baseWithoutExt}${ext}`));
+  } else if (['.ts', '.tsx', '.mts', '.cts'].includes(currentExtension)) {
+    ['.js', '.mjs', '.cjs'].forEach((ext) => candidates.add(`${baseWithoutExt}${ext}`));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (!existsSync(candidate)) {
+        continue;
+      }
+      const stats = statSync(candidate);
+      if (stats.isFile()) {
+        return candidate;
+      }
+      if (stats.isDirectory()) {
+        for (const ext of extensionPriority) {
+          const indexCandidate = resolvePath(candidate, `index${ext}`);
+          try {
+            if (existsSync(indexCandidate)) {
+              const indexStats = statSync(indexCandidate);
+              if (indexStats.isFile()) {
+                return indexCandidate;
+              }
+            }
+          } catch {
+            // Ignore resolution errors
+          }
+        }
+      }
+    } catch {
+      // Ignore resolution errors
+    }
+  }
+
+  return null;
+}
+
+function extractClassFromInitializer(initializer: ts.Expression): ts.ClassLikeDeclarationBase | null {
+  if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) {
+    return extractClassFromFunctionLike(initializer);
+  }
+
+  return extractClassFromExpression(initializer);
+}
+
+function extractClassFromFunctionLike(node: ts.FunctionLikeDeclarationBase): ts.ClassLikeDeclarationBase | null {
+  if (!node.body) {
+    return null;
+  }
+
+  if (ts.isBlock(node.body)) {
+    // First, collect all class declarations in the function body
+    const classDeclarations = new Map<string, ts.ClassLikeDeclarationBase>();
+    for (const statement of node.body.statements) {
+      if (ts.isClassDeclaration(statement) && statement.name) {
+        classDeclarations.set(statement.name.getText(), statement);
+      }
+    }
+
+    // Then look for return statements
+    for (const statement of node.body.statements) {
+      if (ts.isReturnStatement(statement) && statement.expression) {
+        // First try to extract as expression
+        const classNode = extractClassFromExpression(statement.expression);
+        if (classNode) {
+          return classNode;
+        }
+
+        // If that fails, check if the return expression is an identifier
+        // that references a class declaration we found
+        const returnedIdentifier = extractIdentifierFromExpression(statement.expression);
+        if (returnedIdentifier) {
+          const classDecl = classDeclarations.get(returnedIdentifier);
+          if (classDecl) {
+            return classDecl;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  return extractClassFromExpression(node.body);
+}
+
+/**
+ * Extract identifier name from an expression, handling type assertions
+ */
+function extractIdentifierFromExpression(expression: ts.Expression): string | null {
+  if (ts.isIdentifier(expression)) {
+    return expression.getText();
+  }
+  if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+    return extractIdentifierFromExpression(expression.expression);
+  }
+  if (ts.isParenthesizedExpression(expression)) {
+    return extractIdentifierFromExpression(expression.expression);
+  }
+  return null;
+}
+
+function extractClassFromExpression(expression: ts.Expression): ts.ClassLikeDeclarationBase | null {
+  if (ts.isClassExpression(expression)) {
+    return expression;
+  }
+  if (ts.isParenthesizedExpression(expression)) {
+    return extractClassFromExpression(expression.expression);
+  }
+  if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+    return extractClassFromExpression(expression.expression);
+  }
+  return null;
 }
