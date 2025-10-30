@@ -1,12 +1,17 @@
 {
   "name": "lit-docs-generator",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Generate Stencil.js-compatible README documentation for Lit components",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
   "bin": "./dist/cli.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENCE.md"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
